@@ -1,0 +1,506 @@
+#!/usr/bin/perl -w
+
+
+
+# Nagios plugin for confirming daemons are running on AIX 
+
+
+
+
+# CHANGE LOG
+# ---------
+#  2009/04/22	Nick Jeffrey	Script created using korn shell
+#  2013/03/25	Nick Jeffrey	Rewritten in perl
+#  2013/03/25	Nick Jeffrey	add check for /usr/lib/errdemon
+#  2014/05/07	Nick Jeffrey	add check for IBM guardium database health monitor
+#  2014/05/07	Nick Jeffrey	add check for /etc/rc.bootc on AIX 6.1/7.1 (not 5.3)
+#  2015/10/27	Nick Jeffrey	add check for imperva database monitoring agent
+#  2016/11/10	Nick Jeffrey	bug fix in check_errdemon subroutine
+#  2017/12/05	Nick Jeffrey	add check for EMC VNX host agent
+#  2019/04/13	Nick Jeffrey	do not check for sendmail on VIOS, as VIOS 2.6.3.2 will temporarily start/stop sendmail by itself
+
+
+# OUTSTANDING TASKS
+# -----------------
+#  1) figure out what to do with the /etc/rc.bootc file
+
+
+
+# NOTES
+# -----
+#  This script should return one (and only one) line of ouput.  
+#  Multiple lines of output are silently ignored by nagios.
+# 
+#  The line of output will become the body of the alert message sent by nagios
+#
+#  If there are multiple daemons in the wrong starte, this script will only alert on the first error found
+#
+#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh
+#  methods available in nagios.  
+#
+#  If you are using the check_by_ssh method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#      define service {
+#              use                             generic-24x7-service
+#              hostgroup_name                  all_aix
+#              service_description             AIX daemons
+#              check_command                   check_by_ssh!/usr/local/nagios/libexec/check_aix_daemons
+#              }
+#
+#
+#  Alternatively, if you are using the NRPE method, you should have a section similar to the following in 
+#  the services.cfg file:
+#      define service{
+#               use                             generic-24x7-service
+#               hostgroup_name                  all_aix
+#               service_description             AIX daemons
+#               check_command                   check_nrpe!check_aix_daemons -t 30
+#               notification_options            w,c,r                    ; Send notifications about warn, critical, and recovery events
+#  If you are using the NRPE method, you will also need a command definition similar to the following on each monitored host
+#  in the /usr/local/nagios/nrpe/nrpe.cfg file:
+#      command[check_aix_cpu]=/usr/local/nagios/libexec/check_aix_daemons
+#
+
+
+
+
+
+
+use strict;						#enforce good coding practices
+
+my ($CHECK_NAME,$OK,$WARN,$CRITICAL,$UNKNOWN);
+my ($verbose,$key,$ps,$oslevel,$df,$rctcpip,$rcbootc);
+my (%daemons,@processes,$procname);
+$ps        = "/usr/bin/ps";				#location of binary
+$oslevel   = "/usr/bin/oslevel";			#location of binary
+$df        = "/usr/bin/df";				#location of binary
+$rctcpip   = "/etc/rc.tcpip";				#location of text file
+$rcbootc   = "/etc/rc.bootc";				#location of text file
+$verbose   = "no";					#yes/no flag to increae output for debugging
+
+
+#define name of nagios check
+$CHECK_NAME= "AIX daemons";
+
+#
+# Nagios return codes - this script returns a value to nagios for processing
+#
+$OK=0;
+$WARN=1;
+$CRITICAL=2;
+$UNKNOWN=3;
+
+
+
+
+
+
+sub sanity_checks {
+   #
+   # print "Running sanity_checks subroutine \n" if ($verbose eq "yes"); # if ( ! -f "$sed" ) { print "$CHECK_NAME required file $sed not found \n";
+   #
+   if ( ! -f "$ps" ) {
+      print "$CHECK_NAME required file $ps not found \n";
+      exit $UNKNOWN;
+   }
+   if ( ! -x "$ps" ) {
+      print "$CHECK_NAME required file $ps is not executable by the nagios user \n";
+      exit $UNKNOWN;
+   }
+   if ( ! -f "$oslevel" ) {
+      print "$CHECK_NAME required file $oslevel not found \n";
+      exit $UNKNOWN;
+   }
+   if ( ! -x "$oslevel" ) {
+      print "$CHECK_NAME required file $oslevel is not executable by the nagios user \n";
+      exit $UNKNOWN;
+   }
+   if ( ! -f "$df" ) {
+      print "$CHECK_NAME required file $df not found \n";
+      exit $UNKNOWN;
+   }
+   if ( ! -x "$df" ) {
+      print "$CHECK_NAME required file $df is not executable by the nagios user \n";
+      exit $UNKNOWN;
+   }
+   if ( ! -f "$rctcpip" ) {
+      print "$CHECK_NAME required file $rctcpip not found \n";
+      exit $UNKNOWN ;
+   }
+   if ( ! -r "$rctcpip" ) {
+      print "$CHECK_NAME required file $rctcpip is not readable by the nagios user.  You may wish to chmod o+r $rctcpip \n";
+      exit $UNKNOWN; 
+   }
+}								#end of subroutine
+
+
+
+sub get_aix_version {
+   #
+   print "Running get_aix_version subroutine \n" if ($verbose eq "yes");
+   #
+   open(OSLEVEL,"$oslevel -s|");                                #figure out what version of AIX we are using
+   while (<OSLEVEL>) {                                          #read a line from filehandle
+      print "   oslevel is $_ " if ($verbose eq "yes");
+      if ( /([0-9]{4})\-([0-9]{2})\-/ ) {                       #look for oslevel in 5300-12-04-1119 format
+         $oslevel = "$1$2";                                     #convert to 5300-12-04-1119 to 530012 (ie just AIX version and technology level)
+      }
+   }                                                            #end of while block
+   close OSLEVEL;                                               #close filehandle
+   #
+   #
+   # The /etc/rc.bootc file does not exist on AIX 5.3, but will exist on AIX 6.1 and later.
+   # We didn't know the AIX version until now, which is why we did not check for this file in the sanity_checks subroutine.
+   if (  $oslevel >= 610000 ) {                            
+      # the /etc/rc.bootc file exists on AIX 6.1 and 7.1, but not AIX 5.3.  Need to figure out a better way to check for it.
+      if ( ! -f "$rcbootc" ) {
+         print "$CHECK_NAME required file $rcbootc not found \n";
+         exit $UNKNOWN ;
+      }
+      if ( ! -r "$rcbootc" ) {
+         print "$CHECK_NAME required file $rcbootc is not readable by the nagios user.  You may wish to chmod o+r $rcbootc \n";
+         exit $UNKNOWN; 
+      }
+   } 								#end of if block
+}								#end of subroutine
+
+
+
+
+sub get_running_processes {
+   #
+   print "Running get_running_processes subroutine \n" if ($verbose eq "yes");
+   #
+   #get a list of all the processes that are currently running
+   open (IN,"$ps -ef |");					#open a filehandle using command output
+   while (<IN>) {						#read a line from the filehandle
+      push (@processes,$_);					#add the line of output to an array 
+   }								#end of while loop
+   close IN;							#close filehandle
+}								#end of subroutine
+
+
+
+
+
+sub check_rctcpip {
+   #
+   print "Running check_rctcpip subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   # figure out which daemons start automatically at boot time
+   #
+   open (IN,$rctcpip);
+   while (<IN>) {						#read a line from the filehandle
+      if ( /^start ([a-zA-Z0-9\/]+)/ ) {			#find the daemons that start automatically at boot time
+          $daemons{$1}{enabled} = "yes";			#add value to hash
+      }								#end of if block
+      if ( /^#start ([a-zA-Z0-9\/]+)/ ) {			#find the daemons that do not start automatically at boot time
+          $daemons{$1}{enabled} = "no";				#add value to hash
+      }								#end of if block
+   }								#end of while loop
+   close IN;							#close filehandle
+   #
+   #
+   # check to see which processes are running
+   foreach $key (keys %daemons) {                          	#loop through for each daemon
+      $daemons{$key}{running} = "no";				#initialize hash element
+      foreach (@processes) {
+         if ( /$key/ ) {					#check to see if the current daemon is actually running
+            $daemons{$key}{running} = "yes";			#add value to hash
+         }							#end of if block
+      }								#end of if block
+   }								#end of foreach block
+   #
+   # send an alert if any processes are not in the correct state
+   foreach $key (keys %daemons) {                          	#loop through for each daemon
+      next if ( $key =~ /sendmail/ );				#skip any lines containing sendmail - it  is a weird process we will deal with separately
+      if ( ($daemons{$key}{enabled} eq "yes")  &&  ($daemons{$key}{running} eq "no")  ) {
+         print "$CHECK_NAME CRITICAL - the $key daemon is configured to start automatically from the $rctcpip file at boot time, but $key is not currently running. \n";
+         exit $CRITICAL;
+      }								#end of if block
+      if ( ($daemons{$key}{enabled} eq "no")   &&  ($daemons{$key}{running} eq "yes") ) {
+         print "$CHECK_NAME WARN - the $key daemon is running, but is not configured to start automatically from the $rctcpip file. Please check the $rctcpip file to see if this daemon should start automatically at boot time.\n" ;
+         exit $WARN;
+      }								#end of if block
+   }								#end of foreach block
+}								#end of subroutine
+
+
+
+sub check_rcbootc {
+   #
+   print "Running check_rcbootc subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   # figure out which daemons start automatically at boot time
+   #
+   # The /etc/rc.bootc file does not exist on AIX 5.3, but will exist on AIX 6.1 and later.
+   if (  $oslevel >= 610000 ) {                            
+      print "   checking daemons in /etc/rc.bootc \n" if ($verbose eq "yes");
+      #
+      # code to be written.... need to figure out what this file is used for....
+   } 								#end of if block
+}								#end of subroutine
+
+
+ 
+sub check_sendmail {
+   #
+   print "Running check_sendmail subroutine \n" if ($verbose eq "yes");
+   #
+   # check for sendmail separately, as the output from ps does not match the entry in $rctcpip
+   # For example, the $rctcpip entry for sendmail is: #start /usr/lib/sendmail "$src_running" "-bd -q${qpi}"
+   # But the output from ps -ef | grep sendmail   will be:   sendmail: accepting connections
+   #
+   #
+   foreach $key (keys %daemons) {                          	#loop through for each daemon
+      next unless ( $key =~ /sendmail/ );			#skip any daemons except for sendmail
+      $daemons{$key}{running} = "no";				#initialize hash element
+      foreach (@processes) {					#look at all the running processes to see if sendmail is there
+         if ( /sendmail/ ) {					#check to see if the current daemon is actually running
+            $daemons{$key}{running} = "yes";			#add value to hash
+         }							#end of if block
+      }								#end of foreach block
+   }								#end of foreach block
+   #
+   # send an alert if any processes are not in the correct state
+   foreach $key (keys %daemons) {                          	#loop through for each daemon
+      next unless ( $key =~ /sendmail/ );			#skip any lines except for sendmail
+      next if     ( -e "/usr/ios/cli/ioscli" );			#skip for IBM VIOS, because 2.6.3.2 intermittently starts sendmail
+      if ( ($daemons{$key}{enabled} eq "yes")  &&  ($daemons{$key}{running} eq "no")  ) {
+         print "$CHECK_NAME CRITICAL - the $key daemon is configured to start automatically from the $rctcpip file at boot time, but $key is not currently running. Please start $key with this command: sendmail -bd -q30m \n";
+         exit $CRITICAL;
+      }								#end of if block
+      if ( ($daemons{$key}{enabled} eq "no")   &&  ($daemons{$key}{running} eq "yes") ) {
+         print "$CHECK_NAME WARN - the $key daemon is running, but is not configured to start automatically from the $rctcpip file. Please check the $rctcpip file to see if this daemon should start automatically at boot time.\n" ;
+         exit $WARN;
+      }								#end of if block
+   }								#end of foreach block
+}						#end of subroutine
+
+
+
+
+sub check_errdemon {
+   #
+   print "Running check_errdemon subroutine \n" if ($verbose eq "yes");
+   #
+   # check for the AIX error logging daemon /usr/lib/errdemon separately, as it starts from /etc/rc.bootc
+   # Note that the spelling is weird, as it contains "demon" instead of "daemon"
+   #
+   # manually add the key to the hash
+   $key = "/usr/lib/errdemon";					#manually specify the key
+   $daemons{$key}{enabled} = "yes";				#manually add the key to the hash
+   $daemons{$key}{running} = "no";				#initialize hash element to avoid undef errors
+   #
+   # check to see if the errdemon process is running
+   foreach (@processes) {					#look at all the running processes to see if errdemon is there
+      if ( /errdemon/ ) {					#check to see if the current daemon is actually running
+         $daemons{$key}{running} = "yes";			#add value to hash
+       }							#end of if block
+   }								#end of foreach block
+   #
+   # send an alert if any processes are not in the correct state
+   foreach $key (keys %daemons) {                          	#loop through for each daemon
+      next unless ( $key =~ /errdemon/ );			#skip all lines except for errdemon
+      if ( ($daemons{$key}{enabled} eq "yes")  &&  ($daemons{$key}{running} eq "no")  ) {
+         if ( -f $rcbootc ) { 					#the /etc/rc.bootc file only exists on AIX 6.1 and 7.1 (not on 5.3)
+            print "$CHECK_NAME CRITICAL - the $key daemon is configured to start automatically from the $rcbootc file at boot time, but $key is not currently running. Please start $key with this command: $key \n";
+            exit $CRITICAL;
+         }							#end of if block
+         if ( ! -f $rcbootc ) { 				#this section will run for AIX 5.3
+            print "$CHECK_NAME CRITICAL - the $key daemon is configured to start automatically at boot time, but $key is not currently running. Please start $key with this command: startsrc -s $key \n";
+            exit $CRITICAL;
+         }							#end of if block
+      }								#end of if block
+   }								#end of foreach block
+}								#end of subroutine
+
+
+
+
+sub check_guardium {
+   #
+   print "Running check_guardium subroutine \n" if ($verbose eq "yes");
+   #
+   # check for the IBM guardium database health monitor 
+   # this is an (acquired) IBM product that is installed as an AIX kernal module
+   #
+   # Check to see if guardium is installed
+   if ( -f "/usr/local/guardium/guard_stap/guard_stap" ) {		#check for the guardium binary
+      if ( -f "/usr/local/guardium/guard_stap/guard_tap.ini" ) {	#check for the guardium .ini file
+         #
+         # manually add the key to the hash
+         $key = "/usr/local/guardium/guard_stap/guard_stap";		#manually specify the key
+         $daemons{$key}{enabled} = "yes";				#manually add the key to the hash
+         #
+         # check to see if the guardium process is running
+         foreach (@processes) {						#look at all the running processes to see if errdemon is there
+            if ( /guard_stap/ ) {					#check to see if the current daemon is actually running
+               $daemons{$key}{running} = "yes";				#add value to hash
+            }								#end of if block
+         }								#end of foreach block
+         #
+         # send an alert if any processes are not in the correct state
+         foreach $key (keys %daemons) {                          	#loop through for each daemon
+            next unless ( $key =~ /guard_stap/ );			#skip all lines except for the daemon we are interested in
+            if ( ($daemons{$key}{enabled} eq "yes")  &&  ($daemons{$key}{running} eq "no")  ) {
+               print "$CHECK_NAME CRITICAL - the $key daemon is configured to start automatically from the $rcbootc file at boot time, but $key is not currently running. Please start $key with this command: $key \n";
+               exit $CRITICAL;
+            }								#end of if block
+         } 								#end of if block 
+      } 								#end of if block 
+   } 									#end of if block 
+}									#end of subroutine
+
+
+
+sub check_imperva {
+   #
+   print "Running check_imperva subroutine \n" if ($verbose eq "yes");
+   #
+   # check for the imperva database monitoring agent from www.imperva.com
+   #
+   #
+   # These are the processes that should be running:
+   # # ps -ef | grep imperva
+   #   root 14942458 37748752  10 10:32:33      -  0:25 /opt/imperva/ragent/bin/ragentctrl -r /opt/imperva/ragent -d /opt/imperva/ragent/etc -v /opt/imperva/ragent/var -t ragent --port 50101 --ip 127.0.0.1
+   #   root 32178264 37748752   3 10:32:38      -  0:14 /opt/imperva/ragent/bin/ragent -r /opt/imperva/ragent/ -d /opt/imperva/ragent/etc -v /opt/imperva/ragent/var --ncpu 2 --port 50101 --ip 127.0.0.1 --dispPort 50102 --dispIp 127.0.0.1
+   #   root 37748752        1   2 10:32:33      -  0:02 /opt/imperva/ragent/bin/ragentwd --daemon --ncpu 2 -r /opt/imperva/ragent -d /opt/imperva/ragent/etc -v /opt/imperva/ragent/var
+   #
+   #
+   # Check to see if imperva is installed
+   if ( -d "/opt/imperva/ragent" ) {					#check to see if the directory exists
+      print "   found /opt/imperva/ragent directory \n" if ($verbose eq "yes");
+      #
+      # The centralized imperva SecureSphere application will complain if any of the remote agents (like this machine)
+      # have less than 512MB free space in the /opt/imperva/ragent/var directory.  Confirm we have enough space.
+      # # df -k /opt
+      # Filesystem    1024-blocks      Free %Used    Iused %Iused Mounted on
+      # /dev/hd10opt      3145728   1817436   43%    10873     3% /opt
+      #
+      my $opt_free_mb = 0; 						#initialize variable
+      open(DF,"$df -k /opt|");                                		#get free space for /opt/imperva/ragent/var 
+      while (<DF>) {                                          		#read a line from filehandle
+         if ( /[a-z0-9\/]+ +[0-9]+ +([0-9]+)/ ) {                      	#find free disk space in /opt filesystem
+            $opt_free_mb = $1;                                     	#save free space in a variable
+            $opt_free_mb = $opt_free_mb / 1024;                       	#convert KB to MB
+            $opt_free_mb = sprintf( "%.0f", $opt_free_mb );   		#get rid of any decimal places
+            print "   found $opt_free_mb MB free space in /opt \n" if ($verbose eq "yes");
+         }								#end of if block
+      }                                                            	#end of while loop
+      close DF;                                               		#close filehandle
+      if ( $opt_free_mb >= 512 ) {
+         print "   found $opt_free_mb MB free in /opt \n" if ($verbose eq "yes");
+      }								#end of if block
+      if ( $opt_free_mb < 512 ) {
+         print "$CHECK_NAME WARN - the imperva database monitoring agent needs at least 512MB free space in /opt, but there is only $opt_free_mb MB free.  Please free up space in /opt \n";
+         exit $WARN;
+      }								#end of if block
+      #
+      #
+      # check for multiple processes
+      foreach $procname ( "/opt/imperva/ragent/bin/ragentctrl" , "/opt/imperva/ragent/bin/ragent" , "/opt/imperva/ragent/bin/ragentwd" ) {
+         # 
+         print "   checking for $procname process \n" if ($verbose eq "yes");
+         $key = $procname;						#manually specify the key
+         $daemons{$key}{enabled} = "yes";				#assume that if imperva is installed that the daemons should be running
+         $daemons{$key}{running} = "no";				#initialize variable 
+         $daemons{$key}{name}    = "$key";				#add value to hash
+         # confirm the process is currently running
+         foreach (@processes) {						#look at all the running processes to see if errdemon is there
+            if ( /$daemons{$key}{name} / ) {				#check to see if the current daemon is actually running (note we add a space after procname to ragent does not match all 3 processes)
+               $daemons{$key}{running} = "yes";				#add value to hash
+               print "                $daemons{$key}{name} is running \n" if ($verbose eq "yes");
+            } 								#end of if block
+         }								#end of foreach loop
+         # send alert if process is not currently running
+         if ( ($daemons{$key}{enabled} eq "yes")  &&  ($daemons{$key}{running} eq "no")  ) {
+            print "$CHECK_NAME CRITICAL - the $key daemon is not running \n";
+            exit $CRITICAL;
+         }								#end of if block
+      } 								#end of foreach loop
+   } 									#end of if block 
+}									#end of subroutine
+
+
+sub check_emc_unisphere_hostagent {
+   #
+   print "Running check_emc_unisphere_hostagent subroutine \n" if ($verbose eq "yes");
+   #
+   # check for the EMC Unisphere host agent separately, as it starts from /etc/rc.agent
+   #
+   # The process looks similar to:
+   # # ps -ef | grep hostagent
+   #    root  5636160        1   0 17:54:39      -  0:00 /usr/bin/hostagent -f /etc/Unisphere/agent.config
+   #
+   #
+   # Check to see if the application is installed
+   if ( (-f "/usr/bin/hostagent") && (-f "/etc/Unisphere/agent.config") ) { #confirm the binary and config file both exist
+      # manually add the key to the hash
+      $key = "/usr/bin/hostagent";				#manually specify the key
+      $daemons{$key}{enabled} = "yes";				#manually add the key to the hash
+      $daemons{$key}{running} = "no";				#initialize hash element to avoid undef errors
+      #
+      # check to see if the errdemon process is running
+      foreach (@processes) {					#look at all the running processes to see if errdemon is there
+         if ( /$key/ ) {					#check to see if the current daemon is actually running
+            $daemons{$key}{running} = "yes";			#add value to hash
+          }							#end of if block
+      }								#end of foreach block
+      #
+      # send an alert if any processes are not in the correct state
+      foreach $key (keys %daemons) {                          	#loop through for each daemon
+         next unless ( $key =~ /hostagent/ );			#skip all lines except for errdemon
+         if ( ($daemons{$key}{enabled} eq "yes")  &&  ($daemons{$key}{running} eq "no")  ) {
+            if ( -f "/etc/rc.agent" ) { 				#the /etc/rc.agent file is the startup script for the EMC Unisphere agent
+               print "$CHECK_NAME CRITICAL - the $key daemon is configured to start automatically from the /etc/rc.agent file at boot time, but $key is not currently running. Please start $key with this command: /etc/rc.agent start \n";
+               exit $CRITICAL;
+            }							#end of if block
+         }							#end of if block
+      }								#end of foreach block
+   }								#end of if block
+}								#end of subroutine
+
+
+
+
+
+
+
+sub print_output {
+   #
+   print "Running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   # if we get this far, it means that all the monitored daemons are in the appropriate state
+   #
+   print "$CHECK_NAME OK - all monitored daemons are in the appropriate state:  ";	#notice we do not have a newline character
+   foreach $key (keys %daemons) {                          				#loop through for each daemon
+      if ( $daemons{$key}{running} eq "yes" ) {						#to keep the output a reasonable length, only show daemons that are running
+         print " $key";									#print the name of each running daemon
+      }											#end of if block
+   }											#end of foreach loop
+   print "\n";										#finish output with a linefeed character
+   exit $OK;										#exit the script 
+}											#end of subroutine
+
+
+
+
+
+
+
+# ------------------- main body of script
+sanity_checks;			#ensure require files exist
+get_aix_version;		#figure out what version of AIX is running
+get_running_processes;		#get a list of all the running processes
+check_rctcpip;			#check for daemons that start from /etc/rc.tcpip
+check_rcbootc;			#check for daemons that start from /etc/rc.bootc
+check_sendmail;			#check for sendmail
+check_errdemon;			#check for the error loggin daemon
+check_guardium;			#check for IBM guardium database health monitor
+check_imperva;			#check for imperva database health monitor agent
+check_emc_unisphere_hostagent;	#check for EMC VNX storage host agent
+print_output;			#print output

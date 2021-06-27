@@ -57,6 +57,8 @@
 #               service_description             AIX daemons
 #               check_command                   check_nrpe!check_aix_daemons -t 30
 #               notification_options            w,c,r                    ; Send notifications about warn, critical, and recovery events
+#               }
+#
 #  If you are using the NRPE method, you will also need a command definition similar to the following on each monitored host
 #  in the /usr/local/nagios/nrpe/nrpe.cfg file:
 #      command[check_aix_cpu]=/usr/local/nagios/libexec/check_aix_daemons
